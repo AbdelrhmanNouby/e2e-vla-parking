@@ -1,10 +1,10 @@
 # e2e-vla-parking
 
-An end-to-end vision-language-action (VLA) model for automated parking, adapted from [AutoVLA](https://github.com/ucla-mobility/AutoVLA), fine-tuned on CARLA parking data and deployed on an NVIDIA DRIVE Orin.
+An end-to-end vision-language-action (VLA) model for automated parking, adapted from [AutoVLA](https://github.com/ucla-mobility/AutoVLA), fine-tuned on CARLA parking data, and deployed on an NVIDIA DRIVE Orin.
 
-This is a master's project (12 weeks, 26 Oct 2026 to 17 Jan 2027) by [@AbdelrhmanNouby](https://github.com/AbdelrhmanNouby). It is not affiliated with the AutoVLA authors.
+This is a master's project (12 weeks, **23 Nov 2026 to 14 Feb 2027**) by [@AbdelrhmanNouby](https://github.com/AbdelrhmanNouby). It is not affiliated with the AutoVLA authors.
 
-**Status:** in progress. Code lands phase by phase; the [roadmap](#roadmap) lists the phases and their gates.
+**Status:** in progress (Phase 0 — project kickoff). Code lands phase by phase; the [roadmap](#roadmap) lists all phases and their gates.
 
 ## Research question
 
@@ -12,7 +12,7 @@ How much does fine-tuning an AutoVLA-style model on CARLA parking data improve c
 
 ## Architecture
 
-The Orin runs only the model. A laptop simulates the car in CARLA, and a rented cloud GPU trains the weights.
+The Orin runs only the model. A laptop simulates the vehicle in CARLA and runs the low-level controller, while a rented cloud GPU trains the weights.
 
 ### Real-time loop
 
@@ -20,43 +20,41 @@ The Orin runs only the model. A laptop simulates the car in CARLA, and a rented 
 flowchart LR
     subgraph LAPTOP["Laptop (RTX 3060, 6 GB)"]
         CARLA["CARLA simulator<br/>cameras, ego state, target slot"]
-        CTRL["Controller<br/>waypoints to steering, throttle, brake"]
+        CTRL["Controller (10-20 Hz)<br/>waypoints to steering, throttle, brake"]
     end
     subgraph ORIN["NVIDIA DRIVE Orin"]
-        VLM["Qwen2.5-VL-3B<br/>images + prompt in, action tokens out"]
+        VLM["Qwen2.5-VL-3B + Action Tokens<br/>images + prompt in, action tokens out"]
         DEC["Action decoder<br/>tokens to waypoints"]
     end
-    CARLA -->|"frames, state, slot"| VLM
+    CARLA -->|"frames, state, slot (Ethernet)"| VLM
     VLM -->|"action tokens"| DEC
     DEC -->|"waypoints"| CTRL
-    CTRL -->|"control commands"| CARLA
+    CTRL -->|"steer, throttle, brake"| CARLA
 ```
 
-1. CARLA sends camera frames, the car state and the target slot to the Orin.
-2. The model (Qwen2.5-VL-3B with extra action tokens, as in AutoVLA) returns a short sequence of action tokens.
-3. The decoder turns the tokens into waypoints: one motion step every 0.5 s, 4 s ahead.
-4. A controller tracks the waypoints and sends steering, throttle and brake back to CARLA. It follows the latest plan until the next one arrives.
+1. CARLA sends multi-camera RGB frames, ego vehicle state, and target slot pose over Ethernet to the Orin inference endpoint.
+2. The model (`Qwen2.5-VL-3B` extended with `K` action tokens and `<no_reasoning>`, adapted from AutoVLA) returns `N` action tokens in fast mode.
+3. The action decoder maps the tokens through the parking codebook into waypoints: one motion step every `0.5 s` across a `4.0 s` horizon.
+4. A controller running at `10-20 Hz` on the laptop tracks the waypoints and sends steering, throttle, and brake back to CARLA asynchronously while the next plan is inferred.
 
 ### Offline pipeline
 
 ```mermaid
 flowchart LR
     DATA["CARLA parking data<br/>converted to AutoVLA format"] --> FT["LoRA fine-tuning<br/>cloud GPU, fast mode only"]
-    FT --> EXP["Merge, quantize (INT8 / INT4),<br/>build engine"]
-    EXP -->|"new weights"| ORIN["DRIVE Orin"]
+    FT --> EXP["Merge LoRA + resize vocab,<br/>quantize (INT8 / INT4), build engine"]
+    EXP -->|"new weights/engine"| ORIN["DRIVE Orin"]
 ```
 
-Fine-tuning starts from either the released AutoVLA checkpoint or the Qwen2.5-VL-3B base model; the project compares both. Only fast mode (action tokens, no chain-of-thought) is in scope.
+Fine-tuning starts from either the released AutoVLA checkpoint or the `Qwen2.5-VL-3B` base model; the project compares both. Only **fast mode** (direct action tokens, no chain-of-thought) is in scope.
 
 ### Where each machine is used
 
-| Machine | Role |
-| --- | --- |
-| Laptop (RTX 3060, 6 GB) | CARLA, controller, data conversion, small tests |
-| NVIDIA DRIVE Orin | Quantized model inference |
-| Cloud GPU (rented) | Fine-tuning and full-precision reference runs |
-
-CARLA needs a GPU with at least 6 GB, so the laptop meets only the minimum and cannot also run the model. Closed-loop tests therefore run CARLA on the laptop and the model on the Orin, linked by Ethernet.
+| Machine | Role | Notes |
+| --- | --- | --- |
+| Laptop (RTX 3060, 6 GB) | CARLA simulator, `10-20 Hz` controller, data conversion, small smoke tests | Meets the 6 GB minimum for CARLA and cannot co-host the VLM |
+| NVIDIA DRIVE Orin | Quantized model inference and latency/memory/power profiling | Linked to the laptop via Ethernet |
+| Cloud GPU (rented) | Codebook clustering, LoRA fine-tuning, full-precision reference & ablation runs | Rented in focused blocks to manage compute budget |
 
 The inference runtime on the Orin (NVIDIA's DriveOS LLM SDK or TensorRT Edge-LLM) is chosen in Phase 1, depending on the Orin's software stack.
 
@@ -68,20 +66,20 @@ The starting values below adapt AutoVLA's setup and are tuned in the ablations.
 
 | Input | Format | Starting value |
 | --- | --- | --- |
-| Camera images | RGB views from CARLA: front, rear, left, right | 4 cameras x 2 frames (now and 0.5 s earlier) at 448x448, about 2,000 visual tokens. Lighter fallback for the Orin: 4 x 1 frame at 336x336, about 580 tokens |
-| Target slot | Text: x, y (m) and yaw (deg) in the car's frame, plus slot type | Rounded to 0.1 m and 1 degree; type is perpendicular or parallel |
-| Car state | Text: speed, acceleration, steering angle, gear, last two action tokens | |
-| Instruction and mode | Fixed system prompt, "park in the target slot", and a mode flag | Fast mode only |
+| Camera images | RGB views from CARLA: front, rear, left, right | Default: `4 cameras x 2 frames` (now and `-0.5 s`) at `448x448` (~2,000 visual tokens). Lighter fallback for the Orin: `4 x 1` frame at `336x336` (~580 visual tokens) |
+| Target slot | Text: `x, y` (m) and `yaw` (deg) in the car's frame, plus slot type | Rounded to `0.1 m` and `1 deg`; type is `perpendicular` or `parallel` |
+| Car state | Text: speed, acceleration, steering angle, gear, last two action tokens | Captures vehicle dynamics alongside visual frames |
+| Instruction and mode | Fixed system prompt, `"park in the target slot"`, and a mode flag | Fast mode only |
 
 **Outputs**
 
 | Output | Format | Starting value |
 | --- | --- | --- |
-| Action tokens | A short fixed "no reasoning" template, then N tokens from `<action_0>` to `<action_K-1>`. Each token is one 0.5 s motion step (dx, dy, dyaw) in the car's frame | N = 8 (4 s ahead). K is picked from 256, 512 or 1024 by reconstruction error; AutoVLA used 2,048 for driving |
-| Waypoints | The tokens decoded through the codebook into x, y, yaw every 0.5 s | Reversing appears as negative forward displacement, so there is no separate gear output |
-| Vehicle commands | A controller tracks the waypoints: steering from path tracking, throttle and brake from a speed controller | Controller at 10 to 20 Hz |
+| Action tokens | Fixed `<no_reasoning>` template, then `N` tokens from `<action_0>` to `<action_{K-1}>`. Each token is one `0.5 s` motion step `(dx, dy, dyaw)` in the car's frame | `N = 8` (`4.0 s` ahead). `K` is picked from `{256, 512, 1024}` by reconstruction error; AutoVLA used `2,048` for open-road driving |
+| Waypoints | The tokens decoded through the codebook into `(x, y, yaw)` every `0.5 s` | Reversing appears as negative forward displacement, so there is no separate gear output |
+| Vehicle commands | A controller tracks the waypoints: steering from path tracking, throttle and brake from a speed controller | Controller runs at `10-20 Hz` on the latest plan |
 
-One example of a single model call:
+Example of a single model call:
 
 ```text
 Images:  front, rear, left, right x 2 frames
@@ -91,54 +89,57 @@ State:   speed=0.8 m/s, accel=0.1 m/s2, steer=-12 deg, gear=reverse
 Output:  <no_reasoning> <action_412> <action_97> ... (8 action tokens)
 ```
 
-Adding the action tokens enlarges the vocabulary by K entries in the embedding and output layers, so the export to the Orin must handle the extended vocabulary.
+Adding `<no_reasoning>` and `K` action tokens enlarges the vocabulary by `K + 1` entries in the embedding and LM-head layers, so weight merging, quantization, and export to the Orin must preserve the extended vocabulary consistently.
 
 ## Data
 
-The project starts from one public CARLA parking dataset and rebuilds the action codebook for parking motion (reversing, tight turns), since AutoVLA's driving codebook does not cover it.
+The project starts from one public CARLA parking dataset and rebuilds the action codebook specifically for parking motions (reversing, tight turns), since AutoVLA's driving codebook does not cover it.
 
 | Dataset | Size | Notes |
 | --- | --- | --- |
-| [ParkFormer](https://arxiv.org/abs/2506.16856) | 272 episodes, about 46,400 frames at 10 Hz | Perpendicular and parallel layouts, randomized pedestrians |
-| [E2E Parking Dataset](https://arxiv.org/abs/2504.10812) | To be checked | Reference result for the original E2E Parking model: 85.16% success, 0.24 m position error, 0.34 degrees orientation error |
-| [ParkingScenes](https://arxiv.org/abs/2604.22835) | 704 episodes, about 105,000 frames | Release on GitHub announced; availability to be confirmed |
+| [ParkFormer](https://arxiv.org/abs/2506.16856) | 272 episodes, ~46,400 frames at 10 Hz | Perpendicular and parallel layouts, randomized pedestrians |
+| [E2E Parking Dataset](https://arxiv.org/abs/2504.10812) | To be checked | Reference result for the original E2E Parking model: 85.16% success, 0.24 m position error, 0.34 deg orientation error |
+| [ParkingScenes](https://arxiv.org/abs/2604.22835) | 704 episodes, ~105,000 frames | Release on GitHub announced; availability to be confirmed |
 
-Conversion steps: store camera images, car state, target slot pose and future poses (+0.5 s to +4.0 s) per frame; build the codebook with AutoVLA's clustering script for K = 256, 512 and 1024; write AutoVLA-format training JSON; split by episode (80/10/10) and hold out one CARLA map.
+Conversion steps:
+1. Store synchronized camera images, car state, target slot pose, and future poses (`+0.5 s` to `+4.0 s`) per frame.
+2. Build the action codebook with AutoVLA's clustering script for `K` in `{256, 512, 1024}` and measure reconstruction error.
+3. Write AutoVLA-format training JSON, split by episode (`80/10/10`), and hold out one CARLA map.
 
 ## Evaluation
 
 | Axis | Metrics |
 | --- | --- |
 | Closed loop in CARLA | Target success rate, position error (m), orientation error (deg), collision rate, time to park |
-| Open loop | ADE and FDE of the decoded path against the expert path; action-token accuracy |
-| Orin cost | Time per plan (vision encoder, prefill, decoding), peak memory, power, end-to-end loop latency |
-| Quantization fidelity | Share of identical action tokens and mean path deviation against full precision |
+| Open loop | ADE and FDE (m and deg) of the decoded path against the expert path; action-token accuracy |
+| Orin cost | Time per plan (vision encoder, prefill, decoding), peak memory, power draw, end-to-end loop latency |
+| Quantization fidelity | Share of identical action tokens and mean path deviation against full precision (`FP16`/`BF16`) |
 
 Experiments:
 
 | ID | Question | Change |
 | --- | --- | --- |
 | E1 | Does driving pretraining help parking? | Start from the released AutoVLA checkpoint |
-| E2 | Baseline for E1 | Start from Qwen2.5-VL-3B base |
-| E3 | How large a codebook is needed? | K = 256, 512, 1024 |
-| E4 | How much input can the Orin afford? | 4 cameras x 2 frames at 448x448 against 4 x 1 at 336x336 |
-| E5 | What does quantization cost? | FP16, INT8 and INT4 on the Orin |
-| E6 | How much data is needed? | 25%, 50% and 100% of training episodes |
-| E7 | Does the Orin change closed-loop results? | Same weights, GPU against Orin engine |
+| E2 | Baseline for E1 | Start from `Qwen2.5-VL-3B` base |
+| E3 | How large a codebook is needed? | `K = 256, 512, 1024` |
+| E4 | How much visual input can the Orin afford? | `4 cameras x 2 frames` at `448x448` against `4 x 1` at `336x336` |
+| E5 | What does quantization cost? | `FP16`, `INT8`, and `INT4` on the Orin |
+| E6 | How much data is needed? | `25%`, `50%`, and `100%` of training episodes |
+| E7 | Does the Orin change closed-loop results? | Same weights: GPU server against Orin engine |
 
-## Roadmap
+## Roadmap (12 Weeks: 23 Nov 2026 – 14 Feb 2027)
 
-Each phase ends in a go/no-go gate. Weeks run Monday to Sunday.
+Each phase ends in a go/no-go gate. Weeks run Monday to Sunday starting **23 Nov 2026**.
 
-| Phase | Dates | Goal | Gate |
-| --- | --- | --- | --- |
-| 0 | 26 Oct to 1 Nov | Setup and checks | Orin stack recorded, checkpoint runs once, one dataset downloaded, scope approved |
-| 1 | 2 to 22 Nov | Baseline on the Orin | Released checkpoint runs on the Orin with measured latency and memory, or a fallback is chosen |
-| 2 | 9 to 29 Nov | Data, codebook, test harness | Dataset loads in AutoVLA's training code, codebook reconstructs well, scripted closed-loop run completes |
-| 3 | 30 Nov to 20 Dec | Fine-tuning | Fine-tuned model beats the zero-shot checkpoint on held-out open-loop error; closed-loop success measured |
-| 4 | 21 Dec to 3 Jan | Deploy the fine-tuned model on the Orin | Model runs on the Orin inside the CARLA loop and completes full episodes |
-| 5 | 28 Dec to 10 Jan | Evaluation and ablations | Numbers frozen on 10 Jan |
-| 6 | 4 to 17 Jan | Report and demo | Final handover on 17 Jan |
+| Phase | Weeks | Dates | Goal | Gate |
+| --- | --- | --- | --- | --- |
+| 0 | W1 | 23 Nov to 29 Nov 2026 | Setup and checks | Orin stack recorded, checkpoint runs once, one dataset downloaded, scope approved |
+| 1 | W2–W4 | 30 Nov to 20 Dec 2026 | Baseline on the Orin | Released checkpoint runs on the Orin with measured latency and memory, or a fallback is chosen |
+| 2 | W3–W5 | 7 Dec to 27 Dec 2026 | Data, codebook, test harness | Dataset loads in AutoVLA's training code, codebook reconstructs well, scripted closed-loop run completes |
+| 3 | W6–W8 | 28 Dec 2026 to 17 Jan 2027 | Fine-tuning | Fine-tuned model beats the zero-shot checkpoint on held-out open-loop error; closed-loop success measured |
+| 4 | W9–W10 | 18 Jan to 31 Jan 2027 | Deploy the fine-tuned model on the Orin | Model runs on the Orin inside the CARLA loop and completes full episodes |
+| 5 | W10–W11 | 25 Jan to 7 Feb 2027 | Evaluation and ablations | All metrics finalized; **numbers frozen on 7 Feb 2027** |
+| 6 | W11–W12 | 1 Feb to 14 Feb 2027 | Report and demo | Final thesis/project report, reproducible repo, and demo ready; **final handover on 14 Feb 2027** |
 
 ## Repository layout (planned)
 
@@ -147,10 +148,11 @@ The layout will change as code lands.
 ```text
 configs/    training and evaluation configs (AutoVLA configs edited for parking)
 tools/      dataset converters and the codebook builder
-harness/    closed-loop CARLA runner and policy server
+harness/    closed-loop CARLA runner, 10-20 Hz controller, and policy server
 deploy/     export, quantization and Orin engine scripts
 docs/       notes, results and figures
 data/       converted datasets (not committed)
+LICENSE     MIT License
 ```
 
 ## Getting started
@@ -170,4 +172,4 @@ Setup instructions will be added as each phase lands. Prerequisites:
 
 ## License
 
-Not chosen yet. Third-party components (AutoVLA, Qwen2.5-VL, datasets) keep their own licenses.
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details. Third-party components (AutoVLA, Qwen2.5-VL, CARLA, datasets) keep their own licenses.
